@@ -2,3 +2,4 @@ pyserial
 numpy
 matplotlib
 open3d
+PySide6

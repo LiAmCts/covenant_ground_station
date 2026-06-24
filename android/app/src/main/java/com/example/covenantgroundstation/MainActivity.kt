@@ -17,22 +17,30 @@ import org.json.JSONObject
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.Inet4Address
+import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.NetworkInterface
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.util.ArrayDeque
 import java.util.Locale
 import kotlin.concurrent.thread
 import kotlin.math.PI
+import kotlin.math.abs
 import kotlin.math.ceil
 import kotlin.math.cos
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.sin
+import kotlin.math.sqrt
 
 
 private const val UDP_LIDAR_PORT = 56000
 private const val UDP_TELEMETRY_PORT = 56010
+private const val UDP_ARM_PORT = 56020
+
+private const val RASPBERRY_IP = "192.168.1.100"
+
 private const val UDP_RECV_SIZE_BYTES = 4096
 
 private const val PACKET_MAGIC = "CVL1"
@@ -48,20 +56,17 @@ private const val POINTS_PER_FRAME = 12
 private const val MIN_DISTANCE_M = 0.05f
 private const val MAX_DISTANCE_M = 12.0f
 
-private const val SIMULATED_SPEED_X_M_S = 0.25f
-
 private const val GRID_SPACING_M = 5.0f
 private const val MAX_POINTS_IN_MEMORY = 420_000
-private const val MAX_POINTS_DISPLAYED = 32_000
+private const val MAX_POINTS_DISPLAYED = 36_000
 private const val UI_REFRESH_MS = 350L
 
 private const val CONNECTION_TIMEOUT_MS = 2500L
-
 private const val MAP_YAW_SIGN = 1.0f
+private const val POSE_POSITION_EPSILON_M = 0.02f
 
 
 data class ScanStats(
-    val distanceM: Float = 0.0f,
     val elapsedTimeS: Float = 0.0f,
     val scans: Int = 0,
     val frames: Int = 0,
@@ -83,8 +88,11 @@ data class TelemetryState(
     val batteryValid: Boolean? = null,
 
     val velocityMps: Float? = null,
-    val altitudeM: Float? = null,
+    val velocityXMps: Float? = null,
+    val velocityYMps: Float? = null,
+    val velocityZMps: Float? = null,
 
+    val altitudeM: Float? = null,
     val positionXM: Float? = null,
     val positionYM: Float? = null,
     val positionZM: Float? = null,
@@ -110,6 +118,14 @@ data class TelemetryState(
         return lastPacketWallMs > 0L && nowMs - lastPacketWallMs < CONNECTION_TIMEOUT_MS
     }
 
+    fun hasUsablePosePosition(): Boolean {
+        val x = positionXM ?: return false
+        val y = positionYM ?: return false
+        val z = positionZM ?: 0.0f
+
+        return poseReceived && (abs(x) + abs(y) + abs(z)) > POSE_POSITION_EPSILON_M
+    }
+
     companion object {
         fun fromJson(json: JSONObject): TelemetryState {
             return TelemetryState(
@@ -126,8 +142,11 @@ data class TelemetryState(
                 batteryValid = json.optBooleanOrNull("battery_valid"),
 
                 velocityMps = json.optFloatOrNull("velocity_mps", "speed_mps", "ground_speed_mps", "speed"),
-                altitudeM = json.optFloatOrNull("altitude_m", "alt_m", "relative_altitude_m", "z_m"),
+                velocityXMps = json.optFloatOrNull("velocity_x_mps"),
+                velocityYMps = json.optFloatOrNull("velocity_y_mps"),
+                velocityZMps = json.optFloatOrNull("velocity_z_mps"),
 
+                altitudeM = json.optFloatOrNull("altitude_m", "alt_m", "relative_altitude_m", "z_m"),
                 positionXM = json.optFloatOrNull("position_x_m"),
                 positionYM = json.optFloatOrNull("position_y_m"),
                 positionZM = json.optFloatOrNull("position_z_m"),
@@ -181,9 +200,9 @@ class MainActivity : Activity() {
         super.onStart()
 
         lidarReceiver = UdpLidarReceiver(
-            onScanReady = { xyzPoints, stats ->
+            onScanReady = { localScanPoints, stats ->
                 runOnUiThread {
-                    groundStationView.addScan(xyzPoints, stats)
+                    groundStationView.addScan(localScanPoints, stats)
                 }
             }
         )
@@ -212,6 +231,31 @@ class MainActivity : Activity() {
 }
 
 
+class ArmCommandSender {
+
+    fun sendArmState(armed: Boolean) {
+        thread(start = true, name = "CovenantArmCommandSender") {
+            try {
+                val payload = if (armed) "1" else "0"
+                val data = payload.toByteArray(Charsets.US_ASCII)
+
+                DatagramSocket().use { socket ->
+                    val packet = DatagramPacket(
+                        data,
+                        data.size,
+                        InetAddress.getByName(RASPBERRY_IP),
+                        UDP_ARM_PORT
+                    )
+
+                    socket.send(packet)
+                }
+            } catch (_: Exception) {
+            }
+        }
+    }
+}
+
+
 class UdpLidarReceiver(
     private val onScanReady: (FloatArray, ScanStats) -> Unit,
 ) {
@@ -226,10 +270,7 @@ class UdpLidarReceiver(
 
         running = true
 
-        receiverThread = thread(
-            start = true,
-            name = "CovenantUdpLidarReceiver"
-        ) {
+        receiverThread = thread(start = true, name = "CovenantUdpLidarReceiver") {
             receiveLoop()
         }
     }
@@ -244,12 +285,10 @@ class UdpLidarReceiver(
 
     private fun receiveLoop() {
         val lidarBuffer = ByteArrayBuffer()
-
         val currentScanAngles = ArrayList<Float>(900)
         val currentScanDistances = ArrayList<Float>(900)
 
         var previousStartAngle: Float? = null
-
         var scanCount = 0
         var frameCount = 0
         var pointsReceived = 0
@@ -260,7 +299,6 @@ class UdpLidarReceiver(
             val udpSocket = DatagramSocket(null)
             udpSocket.reuseAddress = true
             udpSocket.bind(InetSocketAddress("0.0.0.0", UDP_LIDAR_PORT))
-
             socket = udpSocket
 
             val packetBuffer = ByteArray(UDP_RECV_SIZE_BYTES)
@@ -271,7 +309,6 @@ class UdpLidarReceiver(
                 udpSocket.receive(packet)
 
                 val payload = parseUdpPacket(packet.data, packet.length) ?: continue
-
                 lidarBuffer.append(payload)
 
                 while (lidarBuffer.size() >= FRAME_LENGTH) {
@@ -293,25 +330,21 @@ class UdpLidarReceiver(
                         val elapsedTimeS =
                             (System.nanoTime() - startTimeNs).toFloat() / 1_000_000_000.0f
 
-                        val xPositionM = elapsedTimeS * SIMULATED_SPEED_X_M_S
-
-                        val xyzPoints = buildXyzScan(
+                        val localScanPoints = buildLocalScan(
                             currentScanAngles,
-                            currentScanDistances,
-                            xPositionM
+                            currentScanDistances
                         )
 
-                        pointsReceived += xyzPoints.size / 3
+                        pointsReceived += localScanPoints.size / 3
 
                         val stats = ScanStats(
-                            distanceM = xPositionM,
                             elapsedTimeS = elapsedTimeS,
                             scans = scanCount,
                             frames = frameCount,
                             pointsReceived = pointsReceived,
                         )
 
-                        onScanReady(xyzPoints, stats)
+                        onScanReady(localScanPoints, stats)
 
                         currentScanAngles.clear()
                         currentScanDistances.clear()
@@ -354,7 +387,6 @@ class UdpLidarReceiver(
         buffer.long
 
         val payloadLength = buffer.short.toInt() and 0xFFFF
-
         val payloadStart = UDP_HEADER_SIZE
         val payloadEnd = payloadStart + payloadLength
 
@@ -369,9 +401,7 @@ class UdpLidarReceiver(
         val header = frame[0].toInt() and 0xFF
         val versionLength = frame[1].toInt() and 0xFF
 
-        if (header != FRAME_HEADER || versionLength != FRAME_VER_LEN) {
-            return null
-        }
+        if (header != FRAME_HEADER || versionLength != FRAME_VER_LEN) return null
 
         val startAngleDeg = readUInt16LE(frame, 4) / 100.0f
 
@@ -402,7 +432,6 @@ class UdpLidarReceiver(
         }
 
         val angleStep = angleDelta / (POINTS_PER_FRAME - 1)
-
         val points = ArrayList<LidarPoint>(POINTS_PER_FRAME)
 
         for (i in rawPoints.indices) {
@@ -430,14 +459,12 @@ class UdpLidarReceiver(
     private fun readUInt16LE(data: ByteArray, offset: Int): Int {
         val b0 = data[offset].toInt() and 0xFF
         val b1 = data[offset + 1].toInt() and 0xFF
-
         return b0 or (b1 shl 8)
     }
 
-    private fun buildXyzScan(
+    private fun buildLocalScan(
         angles: List<Float>,
         distances: List<Float>,
-        xPositionM: Float
     ): FloatArray {
         val pointCount = min(angles.size, distances.size)
         val xyz = FloatArray(pointCount * 3)
@@ -448,7 +475,7 @@ class UdpLidarReceiver(
             val angleRad = angles[i] * PI.toFloat() / 180.0f
             val distance = distances[i]
 
-            val x = xPositionM
+            val x = 0.0f
             val y = distance * cos(angleRad)
             val z = distance * sin(angleRad)
 
@@ -476,10 +503,7 @@ class RosTelemetryReceiver(
 
         running = true
 
-        receiverThread = thread(
-            start = true,
-            name = "CovenantRosTelemetryReceiver"
-        ) {
+        receiverThread = thread(start = true, name = "CovenantRosTelemetryReceiver") {
             receiveLoop()
         }
     }
@@ -564,9 +588,7 @@ class ByteArrayBuffer {
                 buffer = buffer.copyOfRange(headerIndex, buffer.size)
             }
 
-            if (buffer.size < FRAME_LENGTH) {
-                return null
-            }
+            if (buffer.size < FRAME_LENGTH) return null
 
             val secondByte = buffer[1].toInt() and 0xFF
 
@@ -615,18 +637,37 @@ data class DashboardLayout(
 )
 
 
+data class MapPose(
+    val x: Float,
+    val y: Float,
+    val z: Float,
+    val yawDeg: Float,
+    val source: String,
+)
+
+
+private enum class TouchMode {
+    NONE,
+    MAP,
+    PANEL_SCROLL,
+    ARM_BUTTON,
+}
+
+
 class GroundStationView(
     context: android.content.Context
 ) : android.view.View(context) {
 
     private val lock = Any()
+    private val armCommandSender = ArmCommandSender()
 
-    private val pointChunks = java.util.ArrayDeque<FloatArray>()
+    private val pointChunks = ArrayDeque<FloatArray>()
     private var totalPointCount = 0
+
+    private val trajectoryPoints = ArrayDeque<FloatArray>()
 
     private var latestStats = ScanStats()
     private var latestTelemetry = TelemetryState()
-
     private var latestScanWallMs = 0L
 
     private val localIpAddress = findLocalIpv4Address() ?: "0.0.0.0"
@@ -635,16 +676,29 @@ class GroundStationView(
     private var panX = 0.0f
     private var panY = 0.0f
 
+    private var integratedX = 0.0f
+    private var integratedY = 0.0f
+    private var integratedZ = 0.0f
+    private var lastIntegrationWallMs = 0L
+
     private var lastTouchX = 0.0f
     private var lastTouchY = 0.0f
-    private var isPanning = false
-    private var gestureStartedOnMap = false
+
+    private var touchMode = TouchMode.NONE
+
+    private var landscapePanelScrollY = 0.0f
+    private var landscapePanelMaxScrollY = 0.0f
+
+    private var armButtonRect = RectF()
+    private var landscapeScrollableRect = RectF()
+
+    private var requestedArmed = false
 
     private val scaleDetector = ScaleGestureDetector(
         context,
         object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
             override fun onScale(detector: ScaleGestureDetector): Boolean {
-                if (!gestureStartedOnMap) return false
+                if (touchMode != TouchMode.MAP) return false
 
                 scalePxPerMeter *= detector.scaleFactor
                 scalePxPerMeter = scalePxPerMeter.coerceIn(10.0f, 240.0f)
@@ -743,7 +797,12 @@ class GroundStationView(
         isFakeBoldText = true
     }
 
-    private val pointPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+    private val pointHaloPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL
+        color = Color.argb(155, 120, 235, 255)
+    }
+
+    private val pointCorePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.FILL
         color = Color.WHITE
         alpha = 255
@@ -752,23 +811,39 @@ class GroundStationView(
     private val statusOnlineColor = Color.rgb(70, 255, 150)
     private val statusOfflineColor = Color.rgb(255, 72, 88)
 
-    fun addScan(xyzPoints: FloatArray, stats: ScanStats) {
-        val yawDegSnapshot = synchronized(lock) {
-            latestTelemetry.mapYawRelativeDeg ?: latestTelemetry.yawRelativeDeg ?: 0.0f
+    fun addScan(localScanPoints: FloatArray, stats: ScanStats) {
+        val poseSnapshot = synchronized(lock) {
+            computeCurrentMapPoseLocked()
         }
 
-        val rotatedPoints = rotateScanWithYaw(xyzPoints, yawDegSnapshot)
+        val globalPoints = transformScanToMap(localScanPoints, poseSnapshot)
 
         synchronized(lock) {
             latestStats = stats
             latestScanWallMs = System.currentTimeMillis()
 
-            pointChunks.addLast(rotatedPoints)
-            totalPointCount += rotatedPoints.size / 3
+            pointChunks.addLast(globalPoints)
+            totalPointCount += globalPoints.size / 3
 
-            while (totalPointCount > MAX_POINTS_IN_MEMORY && pointChunks.isNotEmpty()) {
+            while (totalPointCount > MAX_POINTS_IN_MEMORY && !pointChunks.isEmpty()) {
                 val removed = pointChunks.removeFirst()
                 totalPointCount -= removed.size / 3
+            }
+
+            if (
+                trajectoryPoints.isEmpty() ||
+                distance2D(
+                    trajectoryPoints.last()[0],
+                    trajectoryPoints.last()[1],
+                    poseSnapshot.x,
+                    poseSnapshot.y
+                ) > 0.05f
+            ) {
+                trajectoryPoints.addLast(floatArrayOf(poseSnapshot.x, poseSnapshot.y, poseSnapshot.z))
+
+                while (trajectoryPoints.size > 3000) {
+                    trajectoryPoints.removeFirst()
+                }
             }
         }
 
@@ -777,7 +852,12 @@ class GroundStationView(
 
     fun updateTelemetry(telemetry: TelemetryState) {
         synchronized(lock) {
+            integrateTwistLocked(telemetry)
             latestTelemetry = telemetry
+
+            if (telemetry.armed != null) {
+                requestedArmed = telemetry.armed
+            }
         }
 
         invalidate()
@@ -786,55 +866,205 @@ class GroundStationView(
     override fun onTouchEvent(event: MotionEvent): Boolean {
         val layout = computeLayout()
 
-        when (event.actionMasked) {
-            MotionEvent.ACTION_DOWN -> {
-                gestureStartedOnMap = layout.mapRect.contains(event.x, event.y)
-                isPanning = gestureStartedOnMap
-                lastTouchX = event.x
-                lastTouchY = event.y
+        if (event.actionMasked == MotionEvent.ACTION_DOWN) {
+            lastTouchX = event.x
+            lastTouchY = event.y
 
-                if (!gestureStartedOnMap) {
-                    return true
-                }
-            }
-
-            MotionEvent.ACTION_CANCEL,
-            MotionEvent.ACTION_UP -> {
-                isPanning = false
-                gestureStartedOnMap = false
-                return true
+            touchMode = when {
+                armButtonRect.contains(event.x, event.y) -> TouchMode.ARM_BUTTON
+                layout.isLandscape && landscapeScrollableRect.contains(event.x, event.y) -> TouchMode.PANEL_SCROLL
+                layout.mapRect.contains(event.x, event.y) -> TouchMode.MAP
+                else -> TouchMode.NONE
             }
         }
 
-        if (!gestureStartedOnMap) {
-            return true
-        }
-
-        scaleDetector.onTouchEvent(event)
-
-        if (event.pointerCount > 1) {
-            isPanning = false
-            return true
+        if (touchMode == TouchMode.MAP) {
+            scaleDetector.onTouchEvent(event)
         }
 
         when (event.actionMasked) {
             MotionEvent.ACTION_MOVE -> {
-                if (isPanning) {
-                    val dx = event.x - lastTouchX
-                    val dy = event.y - lastTouchY
+                when (touchMode) {
+                    TouchMode.MAP -> {
+                        if (event.pointerCount <= 1) {
+                            val dx = event.x - lastTouchX
+                            val dy = event.y - lastTouchY
 
-                    panX += dx
-                    panY += dy
+                            panX += dx
+                            panY += dy
 
-                    lastTouchX = event.x
-                    lastTouchY = event.y
+                            lastTouchX = event.x
+                            lastTouchY = event.y
 
-                    invalidate()
+                            invalidate()
+                        }
+                    }
+
+                    TouchMode.PANEL_SCROLL -> {
+                        val dy = event.y - lastTouchY
+
+                        landscapePanelScrollY -= dy
+                        landscapePanelScrollY = landscapePanelScrollY.coerceIn(
+                            0.0f,
+                            landscapePanelMaxScrollY
+                        )
+
+                        lastTouchY = event.y
+
+                        invalidate()
+                    }
+
+                    else -> {
+                    }
                 }
+
+                return true
+            }
+
+            MotionEvent.ACTION_UP -> {
+                if (touchMode == TouchMode.ARM_BUTTON && armButtonRect.contains(event.x, event.y)) {
+                    toggleArmState()
+                }
+
+                touchMode = TouchMode.NONE
+                return true
+            }
+
+            MotionEvent.ACTION_CANCEL -> {
+                touchMode = TouchMode.NONE
+                return true
             }
         }
 
         return true
+    }
+
+    private fun integrateTwistLocked(newTelemetry: TelemetryState) {
+        val now = newTelemetry.lastPacketWallMs
+        val previous = latestTelemetry
+
+        if (now <= 0L) return
+
+        if (newTelemetry.hasUsablePosePosition()) {
+            integratedX = newTelemetry.positionXM ?: integratedX
+            integratedY = newTelemetry.positionYM ?: integratedY
+            integratedZ = newTelemetry.positionZM ?: integratedZ
+            lastIntegrationWallMs = now
+            return
+        }
+
+        if (lastIntegrationWallMs == 0L) {
+            lastIntegrationWallMs = now
+            return
+        }
+
+        val dt = ((now - lastIntegrationWallMs).toFloat() / 1000.0f).coerceIn(0.0f, 0.5f)
+        lastIntegrationWallMs = now
+
+        if (!newTelemetry.twistReceived) return
+
+        val vx = newTelemetry.velocityXMps ?: return
+        val vy = newTelemetry.velocityYMps ?: 0.0f
+        val vz = newTelemetry.velocityZMps ?: 0.0f
+
+        val yawDeg =
+            newTelemetry.mapYawRelativeDeg
+                ?: newTelemetry.poseYawRelativeDeg
+                ?: newTelemetry.yawRelativeDeg
+                ?: previous.mapYawRelativeDeg
+                ?: previous.yawRelativeDeg
+                ?: 0.0f
+
+        val yawRad = yawDeg * MAP_YAW_SIGN * PI.toFloat() / 180.0f
+        val cosYaw = cos(yawRad)
+        val sinYaw = sin(yawRad)
+
+        val globalVx = vx * cosYaw - vy * sinYaw
+        val globalVy = vx * sinYaw + vy * cosYaw
+
+        integratedX += globalVx * dt
+        integratedY += globalVy * dt
+        integratedZ += vz * dt
+    }
+
+    private fun computeCurrentMapPoseLocked(): MapPose {
+        val telemetry = latestTelemetry
+
+        val yaw =
+            telemetry.mapYawRelativeDeg
+                ?: telemetry.poseYawRelativeDeg
+                ?: telemetry.yawRelativeDeg
+                ?: 0.0f
+
+        if (telemetry.hasUsablePosePosition()) {
+            return MapPose(
+                x = telemetry.positionXM ?: 0.0f,
+                y = telemetry.positionYM ?: 0.0f,
+                z = telemetry.positionZM ?: 0.0f,
+                yawDeg = yaw,
+                source = "POSE"
+            )
+        }
+
+        return MapPose(
+            x = integratedX,
+            y = integratedY,
+            z = integratedZ,
+            yawDeg = yaw,
+            source = "TWIST"
+        )
+    }
+
+    private fun transformScanToMap(localScanPoints: FloatArray, pose: MapPose): FloatArray {
+        val yawRad = pose.yawDeg * MAP_YAW_SIGN * PI.toFloat() / 180.0f
+        val cosYaw = cos(yawRad)
+        val sinYaw = sin(yawRad)
+
+        val transformed = FloatArray(localScanPoints.size)
+
+        var i = 0
+
+        while (i + 2 < localScanPoints.size) {
+            val localX = localScanPoints[i]
+            val localY = localScanPoints[i + 1]
+            val localZ = localScanPoints[i + 2]
+
+            val globalX = pose.x + localX * cosYaw - localY * sinYaw
+            val globalY = pose.y + localX * sinYaw + localY * cosYaw
+            val globalZ = pose.z + localZ
+
+            transformed[i] = globalX
+            transformed[i + 1] = globalY
+            transformed[i + 2] = globalZ
+
+            i += 3
+        }
+
+        return transformed
+    }
+
+    private fun distance2D(x1: Float, y1: Float, x2: Float, y2: Float): Float {
+        val dx = x2 - x1
+        val dy = y2 - y1
+        return sqrt(dx * dx + dy * dy)
+    }
+
+    private fun currentArmStateForUi(): Boolean {
+        return latestTelemetry.armed ?: requestedArmed
+    }
+
+    private fun armStateLabel(): String {
+        return if (currentArmStateForUi()) "ARMED" else "DISARMED"
+    }
+
+    private fun armStateColor(): Int {
+        return if (currentArmStateForUi()) statusOfflineColor else statusOnlineColor
+    }
+
+    private fun toggleArmState() {
+        requestedArmed = !currentArmStateForUi()
+        armCommandSender.sendArmState(requestedArmed)
+        invalidate()
     }
 
     override fun onDraw(canvas: Canvas) {
@@ -859,7 +1089,6 @@ class GroundStationView(
         val w = width.toFloat()
         val h = height.toFloat()
         val margin = 18.0f
-
         val isLandscape = w >= h
 
         return if (isLandscape) {
@@ -881,7 +1110,7 @@ class GroundStationView(
 
             DashboardLayout(mapRect, panelRect, true)
         } else {
-            val panelHeight = h * 0.56f
+            val panelHeight = h * 0.50f
 
             val mapRect = RectF(
                 0.0f,
@@ -919,7 +1148,7 @@ class GroundStationView(
         canvas.save()
         canvas.clipRect(mapRect)
 
-        val originX = mapRect.left + mapRect.width() * 0.11f + panX
+        val originX = mapRect.left + mapRect.width() * 0.18f + panX
         val originY = mapRect.top + mapRect.height() * 0.72f + panY
 
         drawGrid(canvas, mapRect, originX, originY)
@@ -932,20 +1161,19 @@ class GroundStationView(
     }
 
     private fun drawGrid(canvas: Canvas, mapRect: RectF, originX: Float, originY: Float) {
-        val currentDistance = latestStats.distanceM
-        val maxDistanceM = max(25.0f, currentDistance + 12.0f)
+        val maxDistanceM = 40.0f
         val xTickCount = ceil(maxDistanceM / GRID_SPACING_M).toInt()
 
-        for (i in 0..xTickCount) {
+        for (i in -2..xTickCount) {
             val xM = i * GRID_SPACING_M
-            val p1 = projectPoint(xM, -10.0f, 0.0f, originX, originY)
-            val p2 = projectPoint(xM, 10.0f, 0.0f, originX, originY)
+            val p1 = projectPoint(xM, -15.0f, 0.0f, originX, originY)
+            val p2 = projectPoint(xM, 15.0f, 0.0f, originX, originY)
 
             val paint = if (i % 2 == 0) gridStrongPaint else gridPaint
 
             canvas.drawLine(p1.first, p1.second, p2.first, p2.second, paint)
 
-            if (i % 2 == 0) {
+            if (i >= 0 && i % 2 == 0) {
                 canvas.drawText(
                     "${xM.toInt()} m",
                     p1.first,
@@ -955,10 +1183,9 @@ class GroundStationView(
             }
         }
 
-        for (yM in -10..10 step 5) {
-            val p1 = projectPoint(0.0f, yM.toFloat(), 0.0f, originX, originY)
+        for (yM in -15..15 step 5) {
+            val p1 = projectPoint(-10.0f, yM.toFloat(), 0.0f, originX, originY)
             val p2 = projectPoint(maxDistanceM, yM.toFloat(), 0.0f, originX, originY)
-
             canvas.drawLine(p1.first, p1.second, p2.first, p2.second, gridPaint)
         }
     }
@@ -980,14 +1207,24 @@ class GroundStationView(
     }
 
     private fun drawTrajectory(canvas: Canvas, originX: Float, originY: Float) {
-        val currentX = latestStats.distanceM
+        val snapshot: List<FloatArray> = synchronized(lock) {
+            trajectoryPoints.toList()
+        }
 
-        if (currentX <= 0.0f) return
+        if (snapshot.size < 2) return
 
-        val start = projectPoint(0.0f, 0.0f, 0.0f, originX, originY)
-        val end = projectPoint(currentX, 0.0f, 0.0f, originX, originY)
+        var previous = snapshot.first()
 
-        canvas.drawLine(start.first, start.second, end.first, end.second, trajectoryPaint)
+        for (i in 1 until snapshot.size) {
+            val current = snapshot[i]
+
+            val p1 = projectPoint(previous[0], previous[1], previous[2], originX, originY)
+            val p2 = projectPoint(current[0], current[1], current[2], originX, originY)
+
+            canvas.drawLine(p1.first, p1.second, p2.first, p2.second, trajectoryPaint)
+
+            previous = current
+        }
     }
 
     private fun drawPointCloud(canvas: Canvas, originX: Float, originY: Float) {
@@ -1002,7 +1239,6 @@ class GroundStationView(
         if (chunksSnapshot.isEmpty() || totalPointsSnapshot <= 0) return
 
         val step = max(1, totalPointsSnapshot / MAX_POINTS_DISPLAYED)
-
         var globalPointIndex = 0
 
         for (chunk in chunksSnapshot) {
@@ -1016,10 +1252,11 @@ class GroundStationView(
 
                     val projected = projectPoint(x, y, z, originX, originY)
 
-                    pointPaint.color = scanColor(z)
-                    pointPaint.alpha = 255
+                    pointHaloPaint.alpha = 150
+                    pointCorePaint.alpha = 255
 
-                    canvas.drawCircle(projected.first, projected.second, 3.6f, pointPaint)
+                    canvas.drawCircle(projected.first, projected.second, 7.2f, pointHaloPaint)
+                    canvas.drawCircle(projected.first, projected.second, 4.3f, pointCorePaint)
                 }
 
                 globalPointIndex += 1
@@ -1029,8 +1266,11 @@ class GroundStationView(
     }
 
     private fun drawDrone(canvas: Canvas, originX: Float, originY: Float) {
-        val currentX = latestStats.distanceM
-        val projected = projectPoint(currentX, 0.0f, 0.0f, originX, originY)
+        val pose = synchronized(lock) {
+            computeCurrentMapPoseLocked()
+        }
+
+        val projected = projectPoint(pose.x, pose.y, pose.z, originX, originY)
 
         val glow = RadialGradient(
             projected.first,
@@ -1053,6 +1293,85 @@ class GroundStationView(
     private fun drawLandscapePanel(canvas: Canvas, panel: RectF) {
         drawPanelBase(canvas, panel)
 
+        val headerBottom = drawLandscapeFixedHeader(canvas, panel)
+
+        landscapeScrollableRect = RectF(
+            panel.left,
+            headerBottom,
+            panel.right,
+            panel.bottom
+        )
+
+        canvas.save()
+        canvas.clipRect(landscapeScrollableRect)
+
+        val contentTop = headerBottom + 24.0f
+        var y = contentTop - landscapePanelScrollY
+        val x = panel.left + 28.0f
+
+        drawSection(canvas, x, y, "NETWORK")
+        y += 36.0f
+
+        drawStat(canvas, x, y, "IP", localIpAddress)
+        y += 54.0f
+        drawStat(canvas, x, y, "LIDAR PORT", UDP_LIDAR_PORT.toString())
+        y += 54.0f
+        drawStat(canvas, x, y, "TELEMETRY PORT", UDP_TELEMETRY_PORT.toString())
+        y += 54.0f
+        drawStat(canvas, x, y, "ARM PORT", UDP_ARM_PORT.toString())
+
+        y += 66.0f
+        drawSection(canvas, x, y, "INFO")
+        y += 36.0f
+
+        drawStat(canvas, x, y, "TIME", formatFloat(latestStats.elapsedTimeS, "s", 1))
+        y += 54.0f
+        drawStat(canvas, x, y, "POINTS", totalPointCount.toString())
+        y += 54.0f
+        drawStatColored(canvas, x, y, "ARM STATE", armStateLabel(), armStateColor())
+        y += 54.0f
+        drawStat(canvas, x, y, "MODE", latestTelemetry.flightMode ?: "—")
+        y += 54.0f
+        drawStat(canvas, x, y, "HEALTH", latestTelemetry.health ?: "—")
+
+        y += 66.0f
+        drawSection(canvas, x, y, "DRONE TELEMETRY")
+        y += 38.0f
+
+        drawStat(canvas, x, y, "BATTERY", formatNullable(latestTelemetry.batteryPercent, "%", 0))
+        y += 50.0f
+        drawStat(canvas, x, y, "VOLTAGE", formatNullable(latestTelemetry.voltageV, "V", 2))
+        y += 50.0f
+        drawStat(canvas, x, y, "CURRENT", formatNullable(latestTelemetry.currentA, "A", 3))
+        y += 50.0f
+        drawStat(canvas, x, y, "SPEED", formatNullable(latestTelemetry.velocityMps, "m/s", 3))
+        y += 50.0f
+        drawStat(canvas, x, y, "ALTITUDE", formatNullable(latestTelemetry.altitudeM, "m", 2))
+
+        y += 66.0f
+        drawSection(canvas, x, y, "IMU")
+        y += 38.0f
+
+        drawStat(canvas, x, y, "ROLL", formatNullable(latestTelemetry.rollDeg, "°", 1))
+        y += 50.0f
+        drawStat(canvas, x, y, "PITCH", formatNullable(latestTelemetry.pitchDeg, "°", 1))
+        y += 50.0f
+        drawStat(canvas, x, y, "YAW", formatNullable(latestTelemetry.mapYawRelativeDeg, "°", 1))
+        y += 50.0f
+        drawStat(canvas, x, y, "YAW SOURCE", latestTelemetry.mapYawSource ?: "—")
+
+        val contentHeight = y - contentTop + landscapePanelScrollY + 30.0f
+        val viewportHeight = landscapeScrollableRect.height() - 24.0f
+
+        landscapePanelMaxScrollY = max(0.0f, contentHeight - viewportHeight)
+        landscapePanelScrollY = landscapePanelScrollY.coerceIn(0.0f, landscapePanelMaxScrollY)
+
+        canvas.restore()
+
+        drawLandscapeScrollIndicator(canvas, panel)
+    }
+
+    private fun drawLandscapeFixedHeader(canvas: Canvas, panel: RectF): Float {
         val now = System.currentTimeMillis()
         val lidarOnline = latestScanWallMs > 0L && now - latestScanWallMs < CONNECTION_TIMEOUT_MS
         val telemetryOnline = latestTelemetry.isOnline(now)
@@ -1072,51 +1391,52 @@ class GroundStationView(
         y += 38.0f
         drawConnectionRow(canvas, x, y, "DRONE INFO", telemetryOnline)
 
-        y += 58.0f
-        drawSection(canvas, x, y, "NETWORK")
-        y += 36.0f
+        y += 30.0f
 
-        drawStat(canvas, x, y, "LOCAL IP", localIpAddress)
-        y += 54.0f
-        drawStat(canvas, x, y, "LIDAR PORT", UDP_LIDAR_PORT.toString())
-        y += 54.0f
-        drawStat(canvas, x, y, "TELEMETRY PORT", UDP_TELEMETRY_PORT.toString())
+        armButtonRect = RectF(
+            panel.left + 28.0f,
+            y,
+            panel.right - 28.0f,
+            y + 78.0f
+        )
 
-        y += 66.0f
-        drawSection(canvas, x, y, "MISSION")
-        y += 36.0f
+        drawArmButton(canvas, armButtonRect)
 
-        drawStat(canvas, x, y, "DISTANCE", formatFloat(latestStats.distanceM, "m", 2))
-        y += 54.0f
-        drawStat(canvas, x, y, "TIME", formatFloat(latestStats.elapsedTimeS, "s", 1))
-        y += 54.0f
-        drawStat(canvas, x, y, "POINTS", totalPointCount.toString())
+        return armButtonRect.bottom + 20.0f
+    }
 
-        y += 66.0f
-        drawSection(canvas, x, y, "DRONE TELEMETRY")
-        y += 38.0f
+    private fun drawLandscapeScrollIndicator(canvas: Canvas, panel: RectF) {
+        if (landscapePanelMaxScrollY <= 1.0f) return
 
-        drawStat(canvas, x, y, "BATTERY", formatNullable(latestTelemetry.batteryPercent, "%", 0))
-        y += 50.0f
-        drawStat(canvas, x, y, "VOLTAGE", formatNullable(latestTelemetry.voltageV, "V", 2))
-        y += 50.0f
-        drawStat(canvas, x, y, "CURRENT", formatNullable(latestTelemetry.currentA, "A", 3))
-        y += 50.0f
-        drawStat(canvas, x, y, "SPEED", formatNullable(latestTelemetry.velocityMps, "m/s", 3))
-        y += 50.0f
-        drawStat(canvas, x, y, "ALTITUDE", formatNullable(latestTelemetry.altitudeM, "m", 2))
+        val trackTop = landscapeScrollableRect.top + 16.0f
+        val trackBottom = panel.bottom - 16.0f
+        val trackHeight = trackBottom - trackTop
 
-        y += 66.0f
-        drawSection(canvas, x, y, "IMU / POSE")
-        y += 38.0f
+        val ratio =
+            landscapeScrollableRect.height() /
+                    (landscapeScrollableRect.height() + landscapePanelMaxScrollY)
 
-        drawStat(canvas, x, y, "ROLL", formatNullable(latestTelemetry.rollDeg, "°", 1))
-        y += 50.0f
-        drawStat(canvas, x, y, "PITCH", formatNullable(latestTelemetry.pitchDeg, "°", 1))
-        y += 50.0f
-        drawStat(canvas, x, y, "MAP YAW", formatNullable(latestTelemetry.mapYawRelativeDeg, "°", 1))
-        y += 50.0f
-        drawStat(canvas, x, y, "YAW SOURCE", latestTelemetry.mapYawSource ?: "—")
+        val thumbHeight = (trackHeight * ratio).coerceIn(42.0f, trackHeight)
+
+        val thumbY =
+            trackTop +
+                    (trackHeight - thumbHeight) *
+                    (landscapePanelScrollY / landscapePanelMaxScrollY)
+
+        val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.argb(120, 120, 180, 220)
+            style = Paint.Style.FILL
+        }
+
+        canvas.drawRoundRect(
+            panel.right - 10.0f,
+            thumbY,
+            panel.right - 5.0f,
+            thumbY + thumbHeight,
+            4.0f,
+            4.0f,
+            paint
+        )
     }
 
     private fun drawPortraitPanel(canvas: Canvas, panel: RectF) {
@@ -1127,11 +1447,13 @@ class GroundStationView(
         val telemetryOnline = latestTelemetry.isOnline(now)
 
         val left = panel.left + 28.0f
-        val col1 = panel.left + 28.0f
-        val col2 = panel.left + panel.width() * 0.36f
-        val col3 = panel.left + panel.width() * 0.68f
 
-        var y = panel.top + 52.0f
+        val col1 = panel.left + 28.0f
+        val col2 = panel.left + panel.width() * 0.28f
+        val col3 = panel.left + panel.width() * 0.52f
+        val col4 = panel.left + panel.width() * 0.76f
+
+        var y = panel.top + 50.0f
 
         titlePaint.textSize = (panel.width() * 0.055f).coerceIn(32.0f, 46.0f)
         canvas.drawText("COVENANT", left, y, titlePaint)
@@ -1141,56 +1463,110 @@ class GroundStationView(
         canvas.drawText("ANDROID GROUND STATION", left, y, labelPaint)
 
         val statusX = panel.centerX() + 20.0f
-        var statusY = panel.top + 48.0f
+        var statusY = panel.top + 46.0f
 
         drawConnectionRow(canvas, statusX, statusY, "LIDAR", lidarOnline)
-        statusY += 42.0f
+        statusY += 40.0f
         drawConnectionRow(canvas, statusX, statusY, "DRONE INFO", telemetryOnline)
 
-        y = panel.top + 145.0f
+        y = panel.top + 130.0f
 
         drawSection(canvas, left, y, "NETWORK")
-        y += 36.0f
+        y += 34.0f
 
         drawCompactStat(canvas, col1, y, "IP", localIpAddress)
         drawCompactStat(canvas, col2, y, "LIDAR", UDP_LIDAR_PORT.toString())
-        drawCompactStat(canvas, col3, y, "TEL", UDP_TELEMETRY_PORT.toString())
+        drawCompactStat(canvas, col3, y, "TELEM", UDP_TELEMETRY_PORT.toString())
+        drawCompactStat(canvas, col4, y, "ARM", UDP_ARM_PORT.toString())
 
-        y += 82.0f
+        y += 74.0f
 
-        drawSection(canvas, left, y, "MISSION")
-        y += 36.0f
+        drawSection(canvas, left, y, "INFO")
+        y += 34.0f
 
-        drawCompactStat(canvas, col1, y, "DIST", formatFloat(latestStats.distanceM, "m", 2))
-        drawCompactStat(canvas, col2, y, "TIME", formatFloat(latestStats.elapsedTimeS, "s", 1))
-        drawCompactStat(canvas, col3, y, "POINTS", totalPointCount.toString())
+        drawCompactStat(canvas, col1, y, "TIME", formatFloat(latestStats.elapsedTimeS, "s", 1))
+        drawCompactStat(canvas, col2, y, "POINTS", totalPointCount.toString())
+        drawCompactStatColored(canvas, col3, y, "ARM", armStateLabel(), armStateColor())
+        drawCompactStat(canvas, col4, y, "MODE", latestTelemetry.flightMode ?: "—")
 
-        y += 82.0f
+        y += 74.0f
+
+        drawCompactStat(canvas, col1, y, "HEALTH", latestTelemetry.health ?: "—")
+
+        y += 70.0f
 
         drawSection(canvas, left, y, "DRONE TELEMETRY")
-        y += 36.0f
+        y += 34.0f
 
         drawCompactStat(canvas, col1, y, "BAT", formatNullable(latestTelemetry.batteryPercent, "%", 0))
         drawCompactStat(canvas, col2, y, "VOLT", formatNullable(latestTelemetry.voltageV, "V", 2))
         drawCompactStat(canvas, col3, y, "CURR", formatNullable(latestTelemetry.currentA, "A", 3))
+        drawCompactStat(canvas, col4, y, "SPEED", formatNullable(latestTelemetry.velocityMps, "m/s", 3))
 
-        y += 82.0f
+        y += 74.0f
 
-        drawSection(canvas, left, y, "MOTION")
-        y += 36.0f
+        drawCompactStat(canvas, col1, y, "ALT", formatNullable(latestTelemetry.altitudeM, "m", 2))
 
-        drawCompactStat(canvas, col1, y, "SPD", formatNullable(latestTelemetry.velocityMps, "m/s", 3))
-        drawCompactStat(canvas, col2, y, "ALT", formatNullable(latestTelemetry.altitudeM, "m", 2))
-        drawCompactStat(canvas, col3, y, "SRC", latestTelemetry.mapYawSource ?: "—")
+        y += 70.0f
 
-        y += 82.0f
-
-        drawSection(canvas, left, y, "IMU / POSE")
-        y += 36.0f
+        drawSection(canvas, left, y, "IMU")
+        y += 34.0f
 
         drawCompactStat(canvas, col1, y, "ROLL", formatNullable(latestTelemetry.rollDeg, "°", 1))
         drawCompactStat(canvas, col2, y, "PITCH", formatNullable(latestTelemetry.pitchDeg, "°", 1))
         drawCompactStat(canvas, col3, y, "YAW", formatNullable(latestTelemetry.mapYawRelativeDeg, "°", 1))
+        drawCompactStat(canvas, col4, y, "SRC", latestTelemetry.mapYawSource ?: "—")
+
+        armButtonRect = RectF(
+            panel.left + 28.0f,
+            panel.bottom - 98.0f,
+            panel.right - 28.0f,
+            panel.bottom - 18.0f
+        )
+
+        drawArmButton(canvas, armButtonRect)
+    }
+
+    private fun drawArmButton(canvas: Canvas, rect: RectF) {
+        val armed = currentArmStateForUi()
+
+        val fillColor = if (armed) {
+            Color.rgb(125, 24, 36)
+        } else {
+            Color.rgb(20, 120, 72)
+        }
+
+        val strokeColor = if (armed) {
+            Color.rgb(255, 78, 96)
+        } else {
+            Color.rgb(90, 255, 170)
+        }
+
+        val text = if (armed) "DISARM MOTORS" else "ARM MOTORS"
+
+        val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = fillColor
+            style = Paint.Style.FILL
+        }
+
+        val strokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = strokeColor
+            style = Paint.Style.STROKE
+            strokeWidth = 3.5f
+        }
+
+        val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.WHITE
+            textSize = 27.0f
+            isFakeBoldText = true
+            textAlign = Paint.Align.CENTER
+        }
+
+        canvas.drawRoundRect(rect, 24.0f, 24.0f, fillPaint)
+        canvas.drawRoundRect(rect, 24.0f, 24.0f, strokePaint)
+
+        val centerY = rect.centerY() - (textPaint.descent() + textPaint.ascent()) / 2.0f
+        canvas.drawText(text, rect.centerX(), centerY, textPaint)
     }
 
     private fun drawPanelBase(canvas: Canvas, panel: RectF) {
@@ -1203,13 +1579,7 @@ class GroundStationView(
         canvas.drawText(text, x, y, sectionPaint)
     }
 
-    private fun drawConnectionRow(
-        canvas: Canvas,
-        x: Float,
-        y: Float,
-        label: String,
-        online: Boolean
-    ) {
+    private fun drawConnectionRow(canvas: Canvas, x: Float, y: Float, label: String, online: Boolean) {
         val color = if (online) statusOnlineColor else statusOfflineColor
         val text = if (online) "ONLINE" else "OFFLINE"
 
@@ -1246,6 +1616,44 @@ class GroundStationView(
         canvas.drawText(value, x, y + 31.0f, smallValuePaint)
     }
 
+    private fun drawStatColored(
+        canvas: Canvas,
+        x: Float,
+        y: Float,
+        label: String,
+        value: String,
+        color: Int
+    ) {
+        labelPaint.textSize = 20.0f
+        smallValuePaint.textSize = 22.0f
+
+        canvas.drawText(label, x, y, labelPaint)
+
+        val previousColor = smallValuePaint.color
+        smallValuePaint.color = color
+        canvas.drawText(value, x, y + 28.0f, smallValuePaint)
+        smallValuePaint.color = previousColor
+    }
+
+    private fun drawCompactStatColored(
+        canvas: Canvas,
+        x: Float,
+        y: Float,
+        label: String,
+        value: String,
+        color: Int
+    ) {
+        labelPaint.textSize = 19.0f
+        smallValuePaint.textSize = 22.0f
+
+        canvas.drawText(label, x, y, labelPaint)
+
+        val previousColor = smallValuePaint.color
+        smallValuePaint.color = color
+        canvas.drawText(value, x, y + 31.0f, smallValuePaint)
+        smallValuePaint.color = previousColor
+    }
+
     private fun projectPoint(
         x: Float,
         y: Float,
@@ -1266,44 +1674,6 @@ class GroundStationView(
         return Pair(screenX, screenY)
     }
 
-    private fun rotateScanWithYaw(points: FloatArray, yawRelativeDeg: Float): FloatArray {
-        val yawRad = yawRelativeDeg * MAP_YAW_SIGN * PI.toFloat() / 180.0f
-        val cosYaw = cos(yawRad)
-        val sinYaw = sin(yawRad)
-
-        val rotated = FloatArray(points.size)
-
-        var i = 0
-
-        while (i + 2 < points.size) {
-            val x = points[i]
-            val y = points[i + 1]
-            val z = points[i + 2]
-
-            val xRot = x * cosYaw - y * sinYaw
-            val yRot = x * sinYaw + y * cosYaw
-
-            rotated[i] = xRot
-            rotated[i + 1] = yRot
-            rotated[i + 2] = z
-
-            i += 3
-        }
-
-        return rotated
-    }
-
-    private fun scanColor(z: Float): Int {
-        val heightRatio = ((z + 3.0f) / 6.0f).coerceIn(0.0f, 1.0f)
-        val blueReduction = (18.0f * heightRatio).toInt()
-
-        return Color.rgb(
-            255,
-            255,
-            (255 - blueReduction).coerceIn(235, 255)
-        )
-    }
-
     private fun formatFloat(value: Float, unit: String, decimals: Int): String {
         return String.format(Locale.US, "%.${decimals}f %s", value, unit)
     }
@@ -1316,7 +1686,12 @@ class GroundStationView(
     companion object {
         fun findLocalIpv4Address(): String? {
             return try {
-                val interfaces = NetworkInterface.getNetworkInterfaces().toList()
+                val interfaces = mutableListOf<NetworkInterface>()
+                val enumeration = NetworkInterface.getNetworkInterfaces()
+
+                while (enumeration.hasMoreElements()) {
+                    interfaces.add(enumeration.nextElement())
+                }
 
                 val preferredInterfaces = interfaces.sortedWith(
                     compareBy<NetworkInterface> {
@@ -1333,7 +1708,9 @@ class GroundStationView(
 
                     val addresses = networkInterface.inetAddresses
 
-                    for (address in addresses) {
+                    while (addresses.hasMoreElements()) {
+                        val address = addresses.nextElement()
+
                         if (!address.isLoopbackAddress && address is Inet4Address) {
                             return address.hostAddress
                         }

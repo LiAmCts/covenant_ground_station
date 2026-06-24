@@ -107,8 +107,6 @@ class CovenantRosTopicsUdpBridge(Node):
         self.initial_imu_yaw_deg = None
         self.initial_pose_yaw_deg = None
 
-        self.last_log_wall_time = 0.0
-
         sensor_qos = make_sensor_qos()
 
         self.create_subscription(
@@ -143,13 +141,6 @@ class CovenantRosTopicsUdpBridge(Node):
             1.0 / SEND_HZ,
             self.send_payload,
         )
-
-        self.get_logger().info(f"Listening battery topic: {BATTERY_TOPIC}")
-        self.get_logger().info(f"Listening IMU topic: {IMU_TOPIC}")
-        self.get_logger().info(f"Listening pose topic: {POSE_TOPIC}")
-        self.get_logger().info(f"Listening twist topic: {TWIST_TOPIC}")
-        self.get_logger().info("QoS: BEST_EFFORT / VOLATILE / KEEP_LAST depth=10")
-        self.get_logger().info(f"Sending UDP telemetry to {TARGET_IP}:{TARGET_PORT}")
 
     def on_battery(self, msg):
         self.last_battery = msg
@@ -207,12 +198,10 @@ class CovenantRosTopicsUdpBridge(Node):
             else:
                 battery_percent = percentage
 
-            battery_valid = voltage > 3.0
-
             payload.update(
                 {
                     "battery_present": bool(self.last_battery.present),
-                    "battery_valid": battery_valid,
+                    "battery_valid": voltage > 3.0,
                     "battery_age_ms": int((now - self.last_battery_wall_time) * 1000.0),
 
                     "battery_percent": round(battery_percent, 1),
@@ -342,10 +331,6 @@ class CovenantRosTopicsUdpBridge(Node):
 
         encoded = json.dumps(payload, separators=(",", ":")).encode("utf-8")
         self.sock.sendto(encoded, (TARGET_IP, TARGET_PORT))
-
-        if now - self.last_log_wall_time > 2.0:
-            self.last_log_wall_time = now
-            self.get_logger().info(json.dumps(payload, indent=2))
 
 
 def main():
